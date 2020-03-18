@@ -1,4 +1,4 @@
-.objb
+*.objb
 
 # Prerequisites
 *.d
