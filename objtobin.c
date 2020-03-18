@@ -12,12 +12,6 @@ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTH
 WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
-/*
-    Some features are incomplete TODO:
-        - Work for multiple N in one file.
-        - Generate tangents
-*/
-
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,17 +61,18 @@ typedef struct Vec3 {
 } Vec3;
 
 typedef struct Header {
-    unsigned int VertexCount; // Number of vertices
-    unsigned int IndexCount; // Number of indices
+    unsigned int MeshCount;
     unsigned int VertexSize; // Num floats making up a vertex
     unsigned int IndexSize; // Num bytes making up an index
     unsigned int Components; // Components making up a vertex
 } Header;
 
-typedef struct Data {
-    float* Vertices;
-    unsigned int* Indices;
-} Data;
+typedef struct Mesh {
+    unsigned int VertexCount; // Number of vertices
+    unsigned int IndexCount; // Number of indices
+    unsigned int VertexOffset; // sizeof(float) * VertexSize offset in to vertex data
+    unsigned int IndexOffset; // IndexSize offset in to vertex data
+} Mesh;
 
 typedef struct Buffers {
     size_t PositionCount;
@@ -92,8 +87,10 @@ typedef struct Buffers {
     unsigned int* TexIndices;
     unsigned int* NormIndices;
 
-    Header Head;
-    Data Dat;
+    Header Header;
+    Mesh Mesh;
+    float* Vertices;
+    unsigned int* Indices;
 } Buffers;
 
 Flags g_Flags = 0;
@@ -113,11 +110,11 @@ bool AllocateBuffers(Buffers* buffers) {
     buffers->PosIndices = malloc(MAX_BUFFER_SIZE * sizeof(int));
     buffers->TexIndices = malloc(MAX_BUFFER_SIZE * sizeof(int));
     buffers->NormIndices = malloc(MAX_BUFFER_SIZE * sizeof(int));
-    buffers->Dat.Indices = malloc(MAX_BUFFER_SIZE * sizeof(unsigned int));
-    buffers->Dat.Vertices = malloc(MAX_BUFFER_SIZE * sizeof(float) * 12);
+    buffers->Indices = malloc(MAX_BUFFER_SIZE * sizeof(unsigned int));
+    buffers->Vertices = malloc(MAX_BUFFER_SIZE * sizeof(float) * 12);
     
     return buffers->Positions && buffers->Texcoords && buffers->Normals && buffers->PosIndices && 
-           buffers->TexIndices && buffers->NormIndices && buffers->Dat.Indices && buffers->Dat.Vertices;
+           buffers->TexIndices && buffers->NormIndices && buffers->Indices && buffers->Vertices;
 }
 
 void FreeBuffers(Buffers* buffers) {
@@ -127,8 +124,8 @@ void FreeBuffers(Buffers* buffers) {
     free(buffers->PosIndices);
     free(buffers->TexIndices);
     free(buffers->NormIndices);
-    free(buffers->Dat.Indices);
-    free(buffers->Dat.Vertices);
+    free(buffers->Indices);
+    free(buffers->Vertices);
 }
 
 void ExtractVec2(Vec2* vec, char* line, const char* delim) {
@@ -194,16 +191,16 @@ void ReadVertexData(FILE* objFile, Buffers* buffers) {
     char* line = NULL;
     size_t len = 0;
     int read;
-    buffers->Head.Components |= VERTEX_POSITION;
+    buffers->Header.Components |= VERTEX_POSITION;
     while ((read = getline(&line, &len, objFile)) != -1 && !CompareIndicator(kPositionIndicator, strtok(line, kVertexDelim))) { }
     line = ReadVec3s(&objFile, buffers->Positions, &buffers->PositionCount, line, kPositionIndicator);
     
     if (CompareIndicator(kTexcoordIndicator, line)) {
-        buffers->Head.Components |= VERTEX_TEXCOORDS;
+        buffers->Header.Components |= VERTEX_TEXCOORDS;
         line = ReadVec2s(&objFile, buffers->Texcoords, &buffers->TexcoordCount, line, kTexcoordIndicator);
     }
     else if (CompareIndicator(kNormalIndicator, line)) {
-        buffers->Head.Components |= VERTEX_NORMALS;
+        buffers->Header.Components |= VERTEX_NORMALS;
         line = ReadVec3s(&objFile, buffers->Normals, &buffers->NormalCount, line, kNormalIndicator);
     }
     else {
@@ -211,11 +208,11 @@ void ReadVertexData(FILE* objFile, Buffers* buffers) {
     }
     
     if (CompareIndicator(kTexcoordIndicator, line)) {
-        buffers->Head.Components |= VERTEX_TEXCOORDS;
+        buffers->Header.Components |= VERTEX_TEXCOORDS;
         line = ReadVec2s(&objFile, buffers->Texcoords, &buffers->TexcoordCount, line, kTexcoordIndicator);
     }
     else if (CompareIndicator(kNormalIndicator, line)) {
-        buffers->Head.Components |= VERTEX_NORMALS;
+        buffers->Header.Components |= VERTEX_NORMALS;
         line = ReadVec3s(&objFile, buffers->Normals, &buffers->NormalCount, line, kNormalIndicator);
     }
 }
@@ -229,61 +226,64 @@ void ReadIndexData(FILE** objFile, Buffers* buffers) {
     
     char delim[3] = "/ ";
     do {
-        ExtractFace(&buffers->PosIndices[i], &buffers->TexIndices[i], &buffers->NormIndices[i], line, delim, &buffers->Head.Components);
-        buffers->Head.IndexCount += 3;
+        ExtractFace(&buffers->PosIndices[i], &buffers->TexIndices[i], &buffers->NormIndices[i], line, delim, &buffers->Header.Components);
+        buffers->Mesh.IndexCount += 3;
         i += 3;
     } while ((read = getline(&line, &len, *objFile)) != -1 && CompareIndicator(kIndexIndicator, strtok(line, kVertexDelim)));
 }
 
 bool ConvertData(FILE* binFile, Buffers* buffers) {
-    buffers->Head.VertexSize = 3; // Assume position
-    buffers->Head.VertexSize += buffers->Head.Components & VERTEX_TEXCOORDS ? 2 : 0;
-    buffers->Head.VertexSize += buffers->Head.Components & VERTEX_NORMALS   ? 3 : 0;
-    buffers->Head.VertexSize += buffers->Head.Components & VERTEX_TANGENTS  ? 3 : 0;
+    buffers->Header.VertexSize = 3; // Assume position
+    buffers->Header.VertexSize += buffers->Header.Components & VERTEX_TEXCOORDS ? 2 : 0;
+    buffers->Header.VertexSize += buffers->Header.Components & VERTEX_NORMALS   ? 3 : 0;
+    buffers->Header.VertexSize += buffers->Header.Components & VERTEX_TANGENTS  ? 3 : 0;
+    buffers->Header.IndexSize = sizeof(unsigned int);
     
-    for (size_t i = 0; i < buffers->Head.IndexCount; ++i) {
-        size_t j = buffers->Head.VertexCount * buffers->Head.VertexSize;
-        float* vertex = &buffers->Dat.Vertices[j];
+    for (unsigned int i = 0; i < buffers->Mesh.IndexCount; ++i) {
+        unsigned int j = buffers->Mesh.VertexCount * buffers->Header.VertexSize;
+        float* vertex = &buffers->Vertices[j];
         float* vptr = vertex;
 
         memcpy(vptr, &buffers->Positions[buffers->PosIndices[i]], sizeof(Vec3));
         vptr += 3;
-        if (buffers->Head.Components & VERTEX_TEXCOORDS) {
+        if (buffers->Header.Components & VERTEX_TEXCOORDS) {
             memcpy(vptr, &buffers->Texcoords[buffers->TexIndices[i]], sizeof(Vec2));
             if (g_Flags & FLAG_FLIP_TEXCOORD_V) vptr[1] = 1.0f - vptr[1];
             vptr += 2;
         }
-        if (buffers->Head.Components & VERTEX_NORMALS) {
+        if (buffers->Header.Components & VERTEX_NORMALS) {
             memcpy(vptr, &buffers->Normals[buffers->NormIndices[i]], sizeof(Vec3));
             vptr += 3;
         }
 
         float* duplicate = NULL;
-        size_t dupIdx;
-        for (dupIdx = 0; dupIdx < buffers->Head.VertexCount; ++dupIdx) {
-            if (VertexEqual(vertex, &buffers->Dat.Vertices[dupIdx * buffers->Head.VertexSize], buffers->Head.VertexSize)) {
-                duplicate = &buffers->Dat.Vertices[dupIdx * buffers->Head.VertexSize];
+        unsigned int dupIdx;
+        for (dupIdx = 0; dupIdx < buffers->Mesh.VertexCount; ++dupIdx) {
+            if (VertexEqual(vertex, &buffers->Vertices[dupIdx * buffers->Header.VertexSize], buffers->Header.VertexSize)) {
+                duplicate = &buffers->Vertices[dupIdx * buffers->Header.VertexSize];
                 break;
             }
         }
-        if (duplicate) buffers->Dat.Indices[i] = dupIdx;
-        else buffers->Dat.Indices[i] = buffers->Head.VertexCount++;
+        if (duplicate) buffers->Indices[i] = dupIdx;
+        else buffers->Indices[i] = buffers->Mesh.VertexCount++;
     }
     
-    size_t count = 1;
-    if (fwrite(&count, sizeof(size_t), 1, binFile) < 1) {
-        printf("Error: Failed to write binary header count! Aborting.");
-        return false;
-    }
-    if (fwrite(&buffers->Head, sizeof(Header), 1, binFile) < 1) {
+    buffers->Header.MeshCount = 1;
+    buffers->Mesh.IndexOffset = 0;
+    buffers->Mesh.VertexOffset = 0;
+    if (fwrite(&buffers->Header, sizeof(Header), 1, binFile) < 1) {
         printf("Error: Failed to write binary header! Aborting.");
         return false;
     }
-    if (fwrite(buffers->Dat.Vertices, sizeof(float), buffers->Head.VertexCount * buffers->Head.VertexSize, binFile) < buffers->Head.VertexCount * buffers->Head.VertexSize) {
+    if (fwrite(&buffers->Mesh, sizeof(Mesh), 1, binFile) < 1) {
+        printf("Error: Failed to write binary mesh! Aborting.");
+        return false;
+    }
+    if (fwrite(buffers->Vertices, sizeof(float), buffers->Mesh.VertexCount * buffers->Header.VertexSize, binFile) < buffers->Mesh.VertexCount * buffers->Header.VertexSize) {
         printf("Error: Failed to write binary vertex data! Aborting.");
         return false;
     }
-    if (fwrite(buffers->Dat.Indices, sizeof(unsigned int), buffers->Head.IndexCount, binFile) < buffers->Head.IndexCount) {
+    if (fwrite(buffers->Indices, sizeof(unsigned int), buffers->Mesh.IndexCount, binFile) < buffers->Mesh.IndexCount) {
         printf("Error: Failed to write binary index data! Aborting.");
         return false;
     }
@@ -322,37 +322,37 @@ bool Convert(const char* inName, const char* outName) {
 }
 
 bool ReadBinaryFile(FILE* binFile) {
-    size_t meshCount;
-    if (fread(&meshCount, sizeof(size_t), 1, binFile) < 1) {
-        printf("Error: Failed to read binary mesh count! Aborting.");
-        return false;
-    }
-
     Header header;
     if (fread(&header, sizeof(Header), 1, binFile) < 1) {
         printf("Error: Failed to read binary header! Aborting.");
         return false;
     }
+    Mesh mesh;
+    if (fread(&mesh, sizeof(Mesh), 1, binFile) < 1) {
+        printf("Error: Failed to read binary mesh! Aborting.");
+        return false;
+    }
 
-    float* vertices = malloc(sizeof(float) * header.VertexSize * header.VertexCount);
-    unsigned int* indices = malloc(sizeof(unsigned int) * header.IndexCount);
+    float* vertices = malloc(sizeof(float) * header.VertexSize * mesh.VertexCount);
+    unsigned int* indices = malloc(sizeof(unsigned int) * mesh.IndexCount);
 
-    if (fread(vertices, sizeof(float) * header.VertexSize, header.VertexCount, binFile) < header.VertexCount) {
+    if (fread(vertices, sizeof(float) * header.VertexSize, mesh.VertexCount, binFile) < mesh.VertexCount) {
         printf("Error: Failed to read binary vertices! Aborting.");
         free(vertices);
         free(indices);
         return false;
     }
-    if (fread(indices, sizeof(unsigned int), header.IndexCount, binFile) < header.IndexCount) {
+    if (fread(indices, sizeof(unsigned int), mesh.IndexCount, binFile) < mesh.IndexCount) {
         printf("Error: Failed to read binary indices! Aborting.");
         free(vertices);
         free(indices);
         return false;
     }
 
-    printf("Object:    Vertex Count %i    Vertex Size %i    Index Count %i    Index Size %i    Components %i\n", header.VertexCount, header.VertexSize, header.IndexCount, header.IndexSize, header.Components);
-    for (size_t i = 0; i < header.VertexCount; ++i) {
-        size_t j = i * header.VertexSize;
+    printf("Object:    Vertex Count %i    Vertex Size %i    Index Count %i    Index Size %i    Components %i\n", 
+        mesh.VertexCount, header.VertexSize, mesh.IndexCount, header.IndexSize, header.Components);
+    for (unsigned int i = 0; i < mesh.VertexCount; ++i) {
+        unsigned int j = i * header.VertexSize;
         printf("Vertex %i v(%f, %f, %f) ", i, vertices[j], vertices[j + 1], vertices[j + 2]);
         j += 3;
         if (header.Components & VERTEX_TEXCOORDS) {
@@ -369,7 +369,7 @@ bool ReadBinaryFile(FILE* binFile) {
         printf("\n");
     }
     printf("Indices\n");
-    for (size_t i = 0; i < header.IndexCount; ++i) {
+    for (unsigned int i = 0; i < mesh.IndexCount; ++i) {
         printf("%i ", indices[i]);
     }
     printf("\n");
@@ -401,15 +401,15 @@ bool BatchBinaries(const char* inBinName, const char* const* srcNames, int srcCo
 }
 
 void OutputHelp() {
-    printf("ObjToBinary help: \n\t"
+    printf("objtobin help: \n\t"
             "Converts Wavefront obj meshes containing vertex positions, uvs, and normals with triangulated faces to an interleaved binary format.\n\t"
             "Output mode (-c):\n\t\tRead a wavefront obj and output it in binary format.\n\t"
-                "Usage: ObjToBinary.exe -c [input obj] [output bin] [flags]\n\t\t"
+                "Usage: objtobin.exe -c [input obj] [output bin] [flags]\n\t\t"
                 "Flags:\n\t\t\t -t (Generate tangents)\n\t\t\t -v (Verbose)\n\t\t\t -f (Flip texcoords vertically)\n\t"
             "Inspect mode (-i):\n\t\tRead a binary obj file and display its data.\n\t\t"
-                "Usage: ObjToBinary.exe -i [input bin]\n\t"
+                "Usage: objtobin.exe -i [input bin]\n\t"
             "Batch mode (-b):\n\t\tBatch the input binary files together to one file.\n\t\t"
-                "Usage: ObjToBinary.exe -b [output bin] [input bin 1, input bin 2, ...]\n\t");
+                "Usage: objtobin.exe -b [output bin] [input bin 1, input bin 2, ...]\n\t");
 }
 
 bool ParseConvertArgs(int argc, char** argv, char** inObjName, char** outBinName) {
