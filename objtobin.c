@@ -18,13 +18,14 @@ WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN 
 #include "getline.c"
 
 #define MAX_BUFFER_SIZE 1000 * 100 // 100,000 data members per buffer
-#define FLT_EQUALS(a, b) abs(a - b) < 0.000001
+#define FLT_EQUALS(a, b) (fabs(a - b) < 0.000001)
+#define GETLINE_ERR -1
 
-const char kHelpArg[6] = "-help";
+const char kFlipTexcoordArg[3] = "-f";
 const char kTangentArg[3] = "-t";
 const char kVerboseArg[3] = "-v";
 const char kInputExt[5] = ".obj";
-const char kVertexDelim[1] = {' '};
+const char kVertexDelim[2] = " ";
 const char kPositionIndicator[2] = "v";
 const char kTexcoordIndicator[3] = "vt";
 const char kNormalIndicator[3] = "vn";
@@ -65,12 +66,14 @@ typedef struct Header {
     unsigned int VertexSize; // Num floats making up a vertex
     unsigned int IndexSize; // Num bytes making up an index
     unsigned int Components; // Components making up a vertex
+    unsigned int TotalVertices;
+    unsigned int TotalIndices;
 } Header;
 
 typedef struct Mesh {
     unsigned int VertexCount; // Number of vertices
     unsigned int IndexCount; // Number of indices
-    unsigned int VertexOffset; // sizeof(float) * VertexSize offset in to vertex data
+    unsigned int VertexOffset; // VertexSize offset in to vertex data
     unsigned int IndexOffset; // IndexSize offset in to vertex data
 } Mesh;
 
@@ -88,7 +91,7 @@ typedef struct Buffers {
     unsigned int* NormIndices;
 
     Header Header;
-    Mesh Mesh;
+    Mesh* Meshes;
     float* Vertices;
     unsigned int* Indices;
 } Buffers;
@@ -112,9 +115,10 @@ bool AllocateBuffers(Buffers* buffers) {
     buffers->NormIndices = malloc(MAX_BUFFER_SIZE * sizeof(int));
     buffers->Indices = malloc(MAX_BUFFER_SIZE * sizeof(unsigned int));
     buffers->Vertices = malloc(MAX_BUFFER_SIZE * sizeof(float) * 12);
+    buffers->Meshes = malloc(30 * sizeof(Mesh));
     
     return buffers->Positions && buffers->Texcoords && buffers->Normals && buffers->PosIndices && 
-           buffers->TexIndices && buffers->NormIndices && buffers->Indices && buffers->Vertices;
+           buffers->TexIndices && buffers->NormIndices && buffers->Indices && buffers->Vertices && buffers->Meshes;
 }
 
 void FreeBuffers(Buffers* buffers) {
@@ -126,6 +130,7 @@ void FreeBuffers(Buffers* buffers) {
     free(buffers->NormIndices);
     free(buffers->Indices);
     free(buffers->Vertices);
+    free(buffers->Meshes);
 }
 
 void ExtractVec2(Vec2* vec, char* line, const char* delim) {
@@ -174,8 +179,8 @@ char* ReadVec2s(FILE** objFile, Vec2* buffer, size_t* count, char* line, const c
     int read;
     do {
         ExtractVec2(&buffer[(*count)++], line, kVertexDelim);
-    } while ((read = getline(&line, &len, *objFile)) != -1 && CompareIndicator(indicator, strtok(line, kVertexDelim)));
-    return line;
+    } while ((read = getline(&line, &len, *objFile)) != GETLINE_ERR && CompareIndicator(indicator, strtok(line, kVertexDelim)));
+    return read == GETLINE_ERR ? NULL : line;
 }
 
 char* ReadVec3s(FILE** objFile, Vec3* buffer, size_t* count, char* line, const char* indicator) {
@@ -183,17 +188,19 @@ char* ReadVec3s(FILE** objFile, Vec3* buffer, size_t* count, char* line, const c
     int read;
     do {
         ExtractVec3(&buffer[(*count)++], line, kVertexDelim);
-    } while ((read = getline(&line, &len, *objFile)) != -1 && CompareIndicator(indicator, strtok(line, kVertexDelim)));
-    return line;
+    } while ((read = getline(&line, &len, *objFile)) != GETLINE_ERR && CompareIndicator(indicator, strtok(line, kVertexDelim)));
+    return read == GETLINE_ERR ? NULL : line;
 }
 
-void ReadVertexData(FILE* objFile, Buffers* buffers) {
+bool ReadVertexData(FILE* objFile, Buffers* buffers) {
     char* line = NULL;
     size_t len = 0;
     int read;
     buffers->Header.Components |= VERTEX_POSITION;
-    while ((read = getline(&line, &len, objFile)) != -1 && !CompareIndicator(kPositionIndicator, strtok(line, kVertexDelim))) { }
+    while ((read = getline(&line, &len, objFile)) != GETLINE_ERR && !CompareIndicator(kPositionIndicator, strtok(line, kVertexDelim))) { }
+    if (read == GETLINE_ERR) return false;
     line = ReadVec3s(&objFile, buffers->Positions, &buffers->PositionCount, line, kPositionIndicator);
+    if (!line) return false;
     
     if (CompareIndicator(kTexcoordIndicator, line)) {
         buffers->Header.Components |= VERTEX_TEXCOORDS;
@@ -204,8 +211,9 @@ void ReadVertexData(FILE* objFile, Buffers* buffers) {
         line = ReadVec3s(&objFile, buffers->Normals, &buffers->NormalCount, line, kNormalIndicator);
     }
     else {
-        return;
+        return true;
     }
+    if (!line) return false;
     
     if (CompareIndicator(kTexcoordIndicator, line)) {
         buffers->Header.Components |= VERTEX_TEXCOORDS;
@@ -215,21 +223,25 @@ void ReadVertexData(FILE* objFile, Buffers* buffers) {
         buffers->Header.Components |= VERTEX_NORMALS;
         line = ReadVec3s(&objFile, buffers->Normals, &buffers->NormalCount, line, kNormalIndicator);
     }
+    return !line ? false : true;
 }
 
-void ReadIndexData(FILE** objFile, Buffers* buffers) {
+bool ReadIndexData(FILE** objFile, Buffers* buffers) {
+    buffers->Meshes[buffers->Header.MeshCount].IndexCount = 0;
     char* line = NULL;
     size_t len = 0;
-    size_t i = 0;
+    size_t i = buffers->Meshes[buffers->Header.MeshCount].IndexOffset;
     int read;
-    while ((read = getline(&line, &len, *objFile)) != -1 && !CompareIndicator(kIndexIndicator, strtok(line, kVertexDelim))) { }
+    while ((read = getline(&line, &len, *objFile)) != GETLINE_ERR && !CompareIndicator(kIndexIndicator, strtok(line, kVertexDelim))) { }
+    if (read == GETLINE_ERR) return false;
     
     char delim[3] = "/ ";
     do {
         ExtractFace(&buffers->PosIndices[i], &buffers->TexIndices[i], &buffers->NormIndices[i], line, delim, &buffers->Header.Components);
-        buffers->Mesh.IndexCount += 3;
+        buffers->Meshes[buffers->Header.MeshCount].IndexCount += 3;
         i += 3;
-    } while ((read = getline(&line, &len, *objFile)) != -1 && CompareIndicator(kIndexIndicator, strtok(line, kVertexDelim)));
+    } while ((read = getline(&line, &len, *objFile)) != GETLINE_ERR && CompareIndicator(kIndexIndicator, strtok(line, kVertexDelim)));
+    return read == GETLINE_ERR && getlineErrno != EOF ? false : true;
 }
 
 bool ConvertData(FILE* binFile, Buffers* buffers) {
@@ -238,52 +250,58 @@ bool ConvertData(FILE* binFile, Buffers* buffers) {
     buffers->Header.VertexSize += buffers->Header.Components & VERTEX_NORMALS   ? 3 : 0;
     buffers->Header.VertexSize += buffers->Header.Components & VERTEX_TANGENTS  ? 3 : 0;
     buffers->Header.IndexSize = sizeof(unsigned int);
-    
-    for (unsigned int i = 0; i < buffers->Mesh.IndexCount; ++i) {
-        unsigned int j = buffers->Mesh.VertexCount * buffers->Header.VertexSize;
-        float* vertex = &buffers->Vertices[j];
-        float* vptr = vertex;
 
-        memcpy(vptr, &buffers->Positions[buffers->PosIndices[i]], sizeof(Vec3));
-        vptr += 3;
-        if (buffers->Header.Components & VERTEX_TEXCOORDS) {
-            memcpy(vptr, &buffers->Texcoords[buffers->TexIndices[i]], sizeof(Vec2));
-            if (g_Flags & FLAG_FLIP_TEXCOORD_V) vptr[1] = 1.0f - vptr[1];
-            vptr += 2;
-        }
-        if (buffers->Header.Components & VERTEX_NORMALS) {
-            memcpy(vptr, &buffers->Normals[buffers->NormIndices[i]], sizeof(Vec3));
+    buffers->Meshes[0].VertexOffset = 0;
+    for (unsigned int m = 0; m < buffers->Header.MeshCount; ++m) {
+        if (m > 0) buffers->Meshes[m].VertexOffset = buffers->Meshes[m - 1].VertexOffset + buffers->Meshes[m - 1].VertexCount;
+        buffers->Meshes[m].VertexCount = 0;
+        for (unsigned int i = buffers->Meshes[m].IndexOffset; i < buffers->Meshes[m].IndexCount + buffers->Meshes[m].IndexOffset; ++i) {
+            unsigned int j = buffers->Meshes[m].VertexCount * buffers->Header.VertexSize + buffers->Meshes[m].VertexOffset * buffers->Header.VertexSize;
+            float* vertex = &buffers->Vertices[j];
+            float* vptr = vertex;
+
+            memcpy(vptr, &buffers->Positions[buffers->PosIndices[i]], sizeof(Vec3));
             vptr += 3;
-        }
-
-        float* duplicate = NULL;
-        unsigned int dupIdx;
-        for (dupIdx = 0; dupIdx < buffers->Mesh.VertexCount; ++dupIdx) {
-            if (VertexEqual(vertex, &buffers->Vertices[dupIdx * buffers->Header.VertexSize], buffers->Header.VertexSize)) {
-                duplicate = &buffers->Vertices[dupIdx * buffers->Header.VertexSize];
-                break;
+            if (buffers->Header.Components & VERTEX_TEXCOORDS) {
+                memcpy(vptr, &buffers->Texcoords[buffers->TexIndices[i]], sizeof(Vec2));
+                if (g_Flags & FLAG_FLIP_TEXCOORD_V) vptr[1] = 1.0f - vptr[1];
+                vptr += 2;
             }
+            if (buffers->Header.Components & VERTEX_NORMALS) {
+                memcpy(vptr, &buffers->Normals[buffers->NormIndices[i]], sizeof(Vec3));
+                vptr += 3;
+            }
+
+            float* duplicate = NULL;
+            unsigned int dupIdx;
+            for (dupIdx = buffers->Meshes[m].VertexOffset; dupIdx < buffers->Meshes[m].VertexCount + buffers->Meshes[m].VertexOffset; ++dupIdx) {
+                if (VertexEqual(vertex, &buffers->Vertices[dupIdx * buffers->Header.VertexSize], buffers->Header.VertexSize)) {
+                    duplicate = &buffers->Vertices[dupIdx * buffers->Header.VertexSize];
+                    break;
+                }
+            }
+            if (duplicate) buffers->Indices[i] = dupIdx;
+            else buffers->Indices[i] = buffers->Meshes[m].VertexOffset + buffers->Meshes[m].VertexCount++;
         }
-        if (duplicate) buffers->Indices[i] = dupIdx;
-        else buffers->Indices[i] = buffers->Mesh.VertexCount++;
+        buffers->Header.TotalVertices += buffers->Meshes[m].VertexCount;
+        buffers->Header.TotalIndices += buffers->Meshes[m].IndexCount;
     }
-    
-    buffers->Header.MeshCount = 1;
-    buffers->Mesh.IndexOffset = 0;
-    buffers->Mesh.VertexOffset = 0;
+
+    // TODO strip duplicate faces
+
     if (fwrite(&buffers->Header, sizeof(Header), 1, binFile) < 1) {
         printf("Error: Failed to write binary header! Aborting.");
         return false;
     }
-    if (fwrite(&buffers->Mesh, sizeof(Mesh), 1, binFile) < 1) {
+    if (fwrite(buffers->Meshes, sizeof(Mesh), buffers->Header.MeshCount, binFile) < buffers->Header.MeshCount) {
         printf("Error: Failed to write binary mesh! Aborting.");
         return false;
     }
-    if (fwrite(buffers->Vertices, sizeof(float), buffers->Mesh.VertexCount * buffers->Header.VertexSize, binFile) < buffers->Mesh.VertexCount * buffers->Header.VertexSize) {
+    if (fwrite(buffers->Vertices, sizeof(float), buffers->Header.TotalVertices * buffers->Header.VertexSize, binFile) < buffers->Header.TotalVertices * buffers->Header.VertexSize) {
         printf("Error: Failed to write binary vertex data! Aborting.");
         return false;
     }
-    if (fwrite(buffers->Indices, sizeof(unsigned int), buffers->Mesh.IndexCount, binFile) < buffers->Mesh.IndexCount) {
+    if (fwrite(buffers->Indices, sizeof(unsigned int), buffers->Header.TotalIndices, binFile) < buffers->Header.TotalIndices) {
         printf("Error: Failed to write binary index data! Aborting.");
         return false;
     }
@@ -305,8 +323,14 @@ bool Convert(const char* inName, const char* outName) {
         return false;
     }
 
-    ReadVertexData(objFile, &buffers);
-    ReadIndexData(&objFile, &buffers);
+    while (true) { // Breaks when reading vertex or index data finds an EOF. Index may end early if there is no EOF newline
+        buffers.Meshes[buffers.Header.MeshCount].IndexOffset = buffers.Header.MeshCount == 0 ? 0 : 
+            buffers.Meshes[buffers.Header.MeshCount - 1].IndexOffset + buffers.Meshes[buffers.Header.MeshCount - 1].IndexCount;
+        if (!ReadVertexData(objFile, &buffers)) break;
+        if (!ReadIndexData(&objFile, &buffers)) break;
+        buffers.Header.MeshCount++;
+    }
+
     ConvertData(binFile, &buffers);
     
     FreeBuffers(&buffers);
@@ -327,52 +351,54 @@ bool ReadBinaryFile(FILE* binFile) {
         printf("Error: Failed to read binary header! Aborting.");
         return false;
     }
-    Mesh mesh;
-    if (fread(&mesh, sizeof(Mesh), 1, binFile) < 1) {
+    Mesh* meshes = malloc(header.MeshCount * sizeof(Mesh));
+    if (fread(meshes, sizeof(Mesh), header.MeshCount, binFile) < header.MeshCount) {
         printf("Error: Failed to read binary mesh! Aborting.");
         return false;
     }
 
-    float* vertices = malloc(sizeof(float) * header.VertexSize * mesh.VertexCount);
-    unsigned int* indices = malloc(sizeof(unsigned int) * mesh.IndexCount);
+    float* vertices = malloc(sizeof(float) * header.VertexSize * header.TotalVertices);
+    unsigned int* indices = malloc(sizeof(unsigned int) * header.TotalIndices);
 
-    if (fread(vertices, sizeof(float) * header.VertexSize, mesh.VertexCount, binFile) < mesh.VertexCount) {
+    if (fread(vertices, sizeof(float) * header.VertexSize, header.TotalVertices, binFile) < header.TotalVertices) {
         printf("Error: Failed to read binary vertices! Aborting.");
         free(vertices);
         free(indices);
         return false;
     }
-    if (fread(indices, sizeof(unsigned int), mesh.IndexCount, binFile) < mesh.IndexCount) {
+    if (fread(indices, sizeof(unsigned int), header.TotalIndices, binFile) < header.TotalIndices) {
         printf("Error: Failed to read binary indices! Aborting.");
         free(vertices);
         free(indices);
         return false;
     }
-
-    printf("Object:    Vertex Count %i    Vertex Size %i    Index Count %i    Index Size %i    Components %i\n", 
-        mesh.VertexCount, header.VertexSize, mesh.IndexCount, header.IndexSize, header.Components);
-    for (unsigned int i = 0; i < mesh.VertexCount; ++i) {
-        unsigned int j = i * header.VertexSize;
-        printf("Vertex %i v(%f, %f, %f) ", i, vertices[j], vertices[j + 1], vertices[j + 2]);
-        j += 3;
-        if (header.Components & VERTEX_TEXCOORDS) {
-            printf("vt(%f, %f) ", vertices[j], vertices[j + 1]);
-            j += 2;
-        }
-        if (header.Components & VERTEX_NORMALS) {
-            printf("vn(%f, %f, %f)", vertices[j], vertices[j + 1], vertices[j + 2]);
+    printf("Mesh count: %i\n", header.MeshCount);
+    for (unsigned int m = 0; m < header.MeshCount; ++m) {
+        printf("Object %i:    Vertex Count %i    Vertex Size %i    Index Count %i    Index Size %i    Components %i    VIOffset (%i,%i)\n", 
+            m, meshes[m].VertexCount, header.VertexSize, meshes[m].IndexCount, header.IndexSize, header.Components, meshes[m].VertexOffset, meshes[m].IndexOffset);
+        for (unsigned int i = 0; i < meshes[m].VertexCount; ++i) {
+            unsigned int j = i * header.VertexSize;
+            printf("Vertex %i v(%f, %f, %f) ", i, vertices[j], vertices[j + 1], vertices[j + 2]);
             j += 3;
+            if (header.Components & VERTEX_TEXCOORDS) {
+                printf("vt(%f, %f) ", vertices[j], vertices[j + 1]);
+                j += 2;
+            }
+            if (header.Components & VERTEX_NORMALS) {
+                printf("vn(%f, %f, %f)", vertices[j], vertices[j + 1], vertices[j + 2]);
+                j += 3;
+            }
+            if (header.Components & VERTEX_TANGENTS) {
+                printf("tn(%f, %f, %f)", vertices[j], vertices[j + 1], vertices[j + 2]);
+            }
+            printf("\n");
         }
-        if (header.Components & VERTEX_TANGENTS) {
-            printf("tn(%f, %f, %f)", vertices[j], vertices[j + 1], vertices[j + 2]);
+        printf("Indices\n");
+        for (unsigned int i = meshes[m].IndexOffset; i < meshes[m].IndexCount + meshes[m].IndexOffset; ++i) {
+            printf("%i ", indices[i]);
         }
         printf("\n");
     }
-    printf("Indices\n");
-    for (unsigned int i = 0; i < mesh.IndexCount; ++i) {
-        printf("%i ", indices[i]);
-    }
-    printf("\n");
 
     free(vertices);
     free(indices);
@@ -429,9 +455,9 @@ bool ParseConvertArgs(int argc, char** argv, char** inObjName, char** outBinName
     *outBinName = argv[3];
 
     for (size_t i = 4; i < argc; ++i) {
-        if (strcmp(argv[i], "-t") == 0) g_Flags |= FLAG_GENERATE_TANGENTS;
-        else if (strcmp(argv[i], "-v") == 0) g_Flags |= FLAG_VERBOSE;
-        else if (strcmp(argv[i], "-f") == 0) g_Flags |= FLAG_FLIP_TEXCOORD_V;
+        if (strcmp(argv[i], kTangentArg) == 0) g_Flags |= FLAG_GENERATE_TANGENTS;
+        else if (strcmp(argv[i], kVerboseArg) == 0) g_Flags |= FLAG_VERBOSE;
+        else if (strcmp(argv[i], kFlipTexcoordArg) == 0) g_Flags |= FLAG_FLIP_TEXCOORD_V;
         else OutputHelp();
     }
     return true;

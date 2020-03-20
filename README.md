@@ -39,6 +39,8 @@ typedef struct Header {
     unsigned int VertexSize; // Num floats making up a vertex
     unsigned int IndexSize; // Num bytes making up an index
     unsigned int Components; // Components making up a vertex
+    unsigned int TotalVertices;
+    unsigned int TotalIndices;
 } Header;
 
 typedef struct Mesh {

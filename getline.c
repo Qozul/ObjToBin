@@ -32,6 +32,8 @@ Cambridge, MA 02139, USA.  */
 #include <stdlib.h>
 #include <errno.h>
 
+int getlineErrno = 0;
+
 /* Read up to (and including) a newline from STREAM into *LINEPTR
    (and null-terminate it). *LINEPTR is a pointer returned from malloc (or
    NULL), pointing to *N characters of space.  It is realloc'd as
@@ -53,8 +55,10 @@ unsigned int len;
    if (ferror (stream))
       return -1;
 
-   if (feof(stream))
+   if (feof(stream)) {
+      getlineErrno = EOF;
       return -1;
+   }
      
    fgets(line,256,stream);
 
